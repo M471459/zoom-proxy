@@ -1,4 +1,4 @@
-// api/zoom-webhook.js  -- solo validación de Zoom
+// api/zoom-webhook.js  -- proxy final
 export const config = { runtime: "edge" };
 
 async function hmacSHA256Hex(message, secret) {
@@ -26,25 +26,22 @@ export default async function handler(req) {
   let json = {};
   try {
     json = bodyText ? JSON.parse(bodyText) : {};
-  } catch (e) {
-    return new Response(
-      JSON.stringify({ ok: false, err: "JSON parse error" }),
-      { status: 400, headers: { "Content-Type": "application/json" } }
-    );
+  } catch {
+    return new Response("bad json", { status: 400 });
   }
 
-  const event = json?.event || "";
-  const secret = process.env.ZOOM_WEBHOOK_SECRET;
+  const event = json?.event;
+  const ZOOM_SECRET = process.env.ZOOM_WEBHOOK_SECRET;
+  const ZOHO_URLS = [
+    process.env.ZOHO_FUNC_ASISTENCIA,
+    process.env.ZOHO_FUNC_REGISTRADOS,
+  ];
 
+  // 1) Handshake de Zoom
   if (event === "endpoint.url_validation") {
-    if (!secret) {
-      return new Response(
-        JSON.stringify({ ok: false, err: "Missing ZOOM_WEBHOOK_SECRET" }),
-        { status: 500, headers: { "Content-Type": "application/json" } }
-      );
-    }
+    if (!ZOOM_SECRET) return new Response("missing secret", { status: 500 });
     const plain = json?.payload?.plainToken || "";
-    const enc = await hmacSHA256Hex(plain, secret);
+    const enc = await hmacSHA256Hex(plain, ZOOM_SECRET);
     return new Response(
       JSON.stringify({ plainToken: plain, encryptedToken: enc }),
       {
@@ -54,11 +51,24 @@ export default async function handler(req) {
     );
   }
 
-  return new Response(
-    JSON.stringify({ ok: true, note: "not a validation event" }),
-    {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
+  // 2) Verificar firma (recomendado)
+  if (!ZOOM_SECRET) return new Response("missing secret", { status: 500 });
+  const ts = req.headers.get("x-zm-request-timestamp") || "";
+  const sig = req.headers.get("x-zm-signature") || "";
+  const expected = await hmacSHA256Hex(`v0:${ts}:${bodyText}`, ZOOM_SECRET);
+  if (sig !== `v0=${expected}`)
+    return new Response("unauthorized", { status: 401 });
+
+  // 3) Reenvío a Zoho (no bloqueante)
+  queueMicrotask(async () => {
+    const headers = { "Content-Type": "application/json" };
+    const tasks = [];
+    for (const url of ZOHO_URLS) {
+      if (url)
+        tasks.push(fetch(url, { method: "POST", headers, body: bodyText }));
     }
-  );
+    await Promise.allSettled(tasks);
+  });
+
+  return new Response("ok", { status: 200 });
 }
